@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+
+# C kernel (build from fastq.c via build_fastq.py)
+fastq.dll
+fastq.obj
+fastq.lib
+fastq.exp
+
+# Runtime working files (written by the app at runtime)
+state.json
+schema.txt
+imatrix.dat
+
+# Models, imatrix sources and generated table data
+*.gguf
+tables/
+refs_tmp/
+
+# Scratch / one-off files
+deleteme/
+results.txt
+tree.txt

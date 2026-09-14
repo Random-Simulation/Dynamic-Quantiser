@@ -1,0 +1,4 @@
+# Python 3.10+; tkinter is stdlib.
+# The gguf-py/ directory is a vendored copy of the gguf library
+# (imported directly; see the sys.path insert in modeldef.py).
+numpy>=1.26

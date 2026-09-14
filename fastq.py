@@ -1,0 +1,104 @@
+"""fastq.py -- ctypes bindings for fastq.dll (fused table-build kernel).
+
+FastQ loads fastq.dll and (through it) the project's ggml-base.dll.
+  quant(tname, a, npr, imx)     -> raw bytes, bit-exact with llama-quantize
+  segment(a, npr, types, imx)   -> (A, S, Q) fused f64 stats for one
+                                   256M-elem-or-smaller segment, all tiers
+Enums and sizes mirror tablebuild.py (same ggml.h values).
+"""
+import ctypes
+from ctypes import (POINTER, c_float, c_int, c_int64, c_size_t, c_void_p,
+                    c_uint8, c_double)
+from pathlib import Path
+
+import numpy as np
+
+APP_DIR = Path(__file__).resolve().parent
+
+# ggml enums (ggml.h, stable) -- superset: ladder + fallback types
+ENUM = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7,
+        "Q8_0": 8, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13,
+        "Q6_K": 14, "IQ2_XXS": 16, "IQ2_XS": 17, "IQ3_XXS": 18,
+        "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22,
+        "IQ4_XS": 23, "IQ1_M": 29}
+
+SEG_MAX = 256_000_000        # elements per kernel call (memory cap)
+
+
+class FastQ:
+    def __init__(self, ggml_dll):
+        lib = ctypes.CDLL(str(APP_DIR / "fastq.dll"))
+        self._lib = lib
+        lib.fq_init.argtypes = [ctypes.c_char_p]
+        lib.fq_init.restype = c_int
+        lib.fq_blck_size.argtypes = [c_int]
+        lib.fq_blck_size.restype = c_int
+        lib.fq_type_size.argtypes = [c_int]
+        lib.fq_type_size.restype = c_int
+        lib.fq_quant.argtypes = [POINTER(c_float), c_int64, c_int64, c_int,
+                                 POINTER(c_float), POINTER(c_uint8),
+                                 c_size_t]
+        lib.fq_quant.restype = c_size_t
+        lib.fq_segment.argtypes = [POINTER(c_float), c_int64, c_int64,
+                                   POINTER(c_int), c_int, POINTER(c_float),
+                                   POINTER(c_double), POINTER(c_double),
+                                   POINTER(c_double), POINTER(c_uint8),
+                                   POINTER(c_float), c_int]
+        lib.fq_segment.restype = c_int
+        if lib.fq_init(str(ggml_dll).encode()) != 0:
+            raise RuntimeError(f"fastq: failed to load {ggml_dll}")
+        self.blck = {t: lib.fq_blck_size(e) for t, e in ENUM.items()}
+        self.rowb = {t: lib.fq_type_size(e) for t, e in ENUM.items()}
+
+    def quant(self, tname, a, npr, imx):
+        """raw quantized bytes (bit-exact with llama-quantize)."""
+        t = ENUM[tname]
+        bs, rb = self.blck[tname], self.rowb[tname]
+        n = a.size
+        buf = np.empty((n // bs) * rb, np.uint8)
+        imxp = (imx.ctypes.data_as(POINTER(c_float))
+                if imx is not None else None)
+        rc = self._lib.fq_quant(a.ctypes.data_as(POINTER(c_float)), n,
+                                c_int64(npr), t, imxp,
+                                buf.ctypes.data_as(POINTER(c_uint8)),
+                                buf.size)
+        if rc != buf.size:
+            raise RuntimeError(f"fastq.quant {tname}: rc={rc}")
+        return buf
+
+    def segment(self, a, npr, tnames, imx):
+        """Fused stats for one segment. tnames: list of ggml type names
+        (already effective types, no F16). Returns
+          (A, S, Q, (S16, Q16, f16_ok))  -- F16 column computed in-kernel;
+          f16_ok False when bf16->f16 overflowed (engine zeros the column)."""
+        n = a.size
+        types = np.array([ENUM[t] for t in tnames], np.int32)
+        # raw capacity: max bytes/elem among the requested types
+        # (Q5_1 = 1.75 B/elem is the worst; q8_0 = 1.0625). tnames may be
+        # empty (every tier fell through to the F16 terminus).
+        cap = (max((n // self.blck[t]) * self.rowb[t] for t in tnames)
+               if tnames else 0)
+        raw = np.empty(cap, np.uint8)
+        bb = np.empty(n, np.float32)
+        A = np.zeros(1, np.float64)
+        imxp = (imx.ctypes.data_as(POINTER(c_float))
+                if imx is not None else None)
+        S = np.zeros(len(tnames) + 1, np.float64)
+        Q = np.zeros_like(S)
+        types_p = (types.ctypes.data_as(POINTER(c_int))
+                   if len(tnames) else None)
+        raw_p = (raw.ctypes.data_as(POINTER(c_uint8)) if cap else None)
+        rc = self._lib.fq_segment(a.ctypes.data_as(POINTER(c_float)), n,
+                                  c_int64(npr), types_p,
+                                  len(tnames), imxp,
+                                  A.ctypes.data_as(POINTER(c_double)),
+                                  S.ctypes.data_as(POINTER(c_double)),
+                                  Q.ctypes.data_as(POINTER(c_double)),
+                                  raw_p,
+                                  bb.ctypes.data_as(POINTER(c_float)), 1)
+        if rc not in (0, -4):
+            raise RuntimeError(f"fastq.segment rc={rc} "
+                               f"(imx-missing={rc == -3}, n={n}, npr={npr})")
+        f16_ok = rc == 0
+        return float(A[0]), S[:-1], Q[:-1], (float(S[-1]), float(Q[-1]),
+                                             f16_ok)
