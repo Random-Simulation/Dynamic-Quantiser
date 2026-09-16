@@ -1,31 +1,75 @@
-# Quant Maker
+# Dynamic Quantiser
 
-Model-agnostic custom quantizer for llama.cpp GGUF models (bf16/f16/f32
-sources). Pick a quant type per tensor group, optionally bump whole layers
-a tier, watch the expected file size and whole-model weight-space cosine
-update live, then either solve for group tiers or a full per-tensor
-assignment under a target size / target deviation, and hand the resulting
-`schema.txt` to `llama-quantize`. No model is hardcoded.
+Allows anyone to make their own dynamic quantisations of LLM .gguf files.
+Automatic, fast and fairly optimal - considerably more accurate than
+standard K quants. Should work with any llama.cpp compatible .gguf file
+(bf16/f16/f32). Chooses tensors at mixed quantisation levels to minimise
+whole-model cosine deviation, which is highly correlated with KLD. Also
+lets you make your own custom quantisations by picking layers/groups at
+different quantisation levels.
 
-## Run
+## Motivation
 
-    python quant_maker.py
+Many local LLM users are VRAM constrained, and this tool lets anyone make
+exact-size quantised models that are considerably better in accuracy than
+standard Qx_K_M quants. Whole-model cosine deviation is highly correlated
+with KLD (a 0.99 Pearson correlation) - a good measure of quant quality.
+Once the initial table has been built, solutions are just seconds.
 
-## Pipeline
+## QuickStart
 
-1. **modeldef.py** -- reads only the GGUF header (tensor inventory, group
-   classification, `n_layer`); ports llama.cpp's
-   `tensor_allows_quantization`.
-2. **tablebuild2.py** (fast path, fused C kernel in `fastq.c`/`fastq.dll`)
-   or **tablebuild.py** (numpy reference engine) -- build a per-tensor,
-   per-tier cosine table (S/Q/C columns) into `tables/`. Resumable.
-3. **qsolve.py** (group-level) / **qfullsolve.py** (full per-tensor) --
-   solve `max cosine s.t. target size` or `min size s.t. target cosine`.
-4. **quant_maker.py** -- tkinter GUI tying it together: table build, live
-   size/cosine estimates, `schema.txt`, `llama-quantize`, imatrix
-   generation.
+1. Double click `Dynamic-Quantiser.exe` (or run `python quant_maker.py`)
+2. Enter the path for a bf16 model in **Source**
+3. Enter the path to the llama.cpp binaries in **Binaries**
+4. Optionally enter an imatrix path (or make one)
+5. Click **Build Table** (this takes a while, ~30s per GB)
+6. Click **Make Dynamic Quant**
 
-## CLI entry points
+The table is a one-off build. After that, solutions are just seconds.
+
+## How it works
+
+There are 3 different algorithms in the program:
+
+1. **Make Dynamic Quant** - the most accurate, full solution. It minimises
+   whole-model cosine deviation for a fixed file size, choosing the best
+   quantisation level for every individual tensor. Requires a target file
+   size.
+2. **Minimise cosine deviation** - minimises whole-model cosine deviation,
+   but not at tensor level; instead it uses a much more approximate solution
+   at layer/group level. Useful for making your own custom quants - easy to
+   tweak from a decent base solution. Also requires a target file size.
+3. **Minimise disk size** - again at layer/group level (not tensor level),
+   this does the same thing as 2, but minimises disk size instead, subject
+   to a fixed cosine deviation. Requires a target cosine deviation.
+
+## Requirements
+
+- Python 3.10+ with `numpy` (see `requirements.txt`).
+- The llama.cpp binaries: `llama-quantize`, `llama-imatrix` and
+  `ggml-base.dll`. Drop them in a `binaries` folder next to the app (it
+  also looks in a couple of other spots and your system `PATH`).
+- A starting `.gguf` model - a bf16 one works best.
+
+`gguf-py/` is a bundled copy of the `gguf` library, so there's nothing
+extra to install.
+
+## Files
+
+1. **modeldef.py** - peeks at the model so it knows what tensors are in
+   there, how they group together, and which ones are safe to quantise.
+2. **tablebuild2.py** - the fast table builder. It works out, for every
+   tensor, what it looks like at each quant size and roughly how much
+   quality you'd lose, then saves that to `tables/`. If it gets interrupted
+   you can pick up where it left off. (`tablebuild.py` does the same thing
+   in pure Python, a little slower.)
+3. **qsolve.py** / **qfullsolve.py** - given a target file size, work out
+   the best mix of tensor sizes so the model stays as accurate as possible.
+4. **quant_maker.py** - The GUI. It builds the table,
+   shows live size/accuracy estimates as you tweak things, and runs the
+   final quantisation.
+
+## Command line
 
     # fast table (K ladder) / full table
     python tablebuild2.py --source m.gguf [--ladder-kind k|full]
@@ -34,21 +78,14 @@ assignment under a target size / target deviation, and hand the resulting
     # compile the C kernel (one-off, MSVC)
     python build_fastq.py
 
-## Requirements
+## Project layout
 
-- Python 3.10+ with `numpy` (see `requirements.txt`).
-- `ggml-base.dll` (llama.cpp) and `llama-quantize` / `llama-imatrix`,
-  searched in `<project>/binaries`, `../binaries`, `../app`, then `PATH`.
-- `gguf-py/` -- vendored copy of the `gguf` library (imported directly via
-  a `sys.path` insert; no pip install needed).
-
-## Layout
-
-- `quant_maker.py` -- GUI entry point
-- `modeldef.py` / `qmodel.py` -- structure + size/cosine model
-- `qsolve.py` / `qfullsolve.py` -- solvers
-- `tablebuild.py` / `tablebuild2.py` / `tablestore.py` -- table engines +
-  store (format v2, `tables/`, indexed by `tables/index.json`)
-- `fastq.py` / `fastq.c` / `fastq.dll` -- fused build kernel + bindings
-- `build_fastq.py` -- compiles the kernel
-- `QuantMaker.spec` -- PyInstaller spec (`build/` + `dist/` are outputs)
+- `quant_maker.py` - the app you run (the window)
+- `modeldef.py` / `qmodel.py` - understand the model, estimate size/accuracy
+- `qsolve.py` / `qfullsolve.py` - the solvers that pick the best mix of sizes
+- `tablebuild.py` / `tablebuild2.py` / `tablestore.py` - build and save the
+  size/accuracy table
+- `fastq.py` / `fastq.c` / `fastq.dll` - the fast C bit that speeds up table
+  building
+- `build_fastq.py` - compiles that C bit (only needed once)
+- `Dynamic-Quantiser.spec` - recipe for building the `Dynamic-Quantiser.exe` build

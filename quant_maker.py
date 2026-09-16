@@ -94,7 +94,7 @@ class App:
         self._loading = False          # suppress rebuilds while restoring state
         self._numpy_warned = False     # only warn about missing numpy once
 
-        root.title("Quant Maker")
+        root.title("Dynamic Quantiser")
         root.geometry("500x1000")
         root.minsize(500, 1000)
         style = ttk.Style(root)
@@ -610,7 +610,7 @@ class App:
         self.dev_lbl.config(text="Expected cosine deviation: -")
         self.err_lbl.config(text="")
         if m is not None:
-            self.root.title("Dynamic Quant Maker" )
+            self.root.title("Dynamic Quantiser" )
             self._rebuild_groups(m["GROUPS"], self._active_ladder())
             self._layer_hint.config(text=f"(0-{m['n_layer']}) e.g. 0,5,7,12")
             lv = self.layers_var.get().strip()
@@ -620,7 +620,7 @@ class App:
                 except ValueError:
                     self.layers_var.set("")   # out of range for this model
         else:
-            self.root.title("Quant Maker")
+            self.root.title("Dynamic Quantiser")
             self._rebuild_groups([], [])
             self._layer_hint.config(text="(none)  ")
         self._update_size_hint()

@@ -45,7 +45,8 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='QuantMaker',
+    name='Dynamic-Quantiser',
+    icon='dynamic-quantiser.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -64,5 +65,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='QuantMaker',
+    name='Dynamic-Quantiser',
 )
