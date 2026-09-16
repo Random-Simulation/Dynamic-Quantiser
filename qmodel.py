@@ -15,6 +15,8 @@ cosine and deviation (1 - cos) only.
 """
 from pathlib import Path
 
+import re
+
 import modeldef
 import tablestore
 
@@ -135,9 +137,11 @@ def find_cos_table(kind):
         if _BUILD_KIND == "k":
             p = tablestore.find_table(src, False, None, "k")
         else:
-            p = tablestore.find_table(
-                src, kind == "imatrix",
-                imx if kind == "imatrix" else None, "full")
+            # Full builds are always built with imatrix (build_table
+            # enforces it), so always look up the imatrix table -- the
+            # GUI checkbox only gates the final llama-quantize --imatrix
+            # flag, not table discovery.
+            p = tablestore.find_table(src, True, imx, "full")
         if p is not None:
             return p
     return None
@@ -278,7 +282,17 @@ def build_assignment(tiers, override_layers, steps):
 
 
 def schema_text(rows):
-    return "\n".join(f"{n}={t}" for n, t, _ in rows) + "\n"
+    # Each tensor-type-file line's name is compiled by llama-quantize as a
+    # REGEX and matched with std::regex_search (substring, first-match-wins
+    # in file order). Tensor names contain '.' (a regex wildcard) and have
+    # prefix relationships, so a raw name can match a DIFFERENT tensor: e.g.
+    # a frozen 1-D tensor 'blk.N.ssm_a' (F32) is a regex prefix of the
+    # quantizable 'blk.N.ssm_alpha.weight' and would hijack its type, storing
+    # it as F32 instead of its intended tier (size drift). Anchoring the
+    # escaped name to the full string (^...$) makes each line match ONLY its
+    # own tensor exactly. (llama-quantize lowercases the pattern; tensor names
+    # are already lowercase, so exact-match is preserved.)
+    return "\n".join(f"^{re.escape(n)}$={t}" for n, t, _ in rows) + "\n"
 
 
 def expected_bytes(rows):
@@ -352,13 +366,18 @@ def size_estimate(rows, use_imatrix=False):
 
 def size_bounds(kind="plain"):
     """(min_gb, max_gb) feasible from the table: all-quantizable at the
-    smallest tier vs at F16 (frozen c0 + overhead always included)."""
+    per-tensor smallest tier vs at F16 (frozen c0 + overhead always
+    included). The floor is the per-tensor min (NOT raw column 0): a tier's
+    column can be larger than another tier's for a given tensor (shape
+    fallback, or an uncovered-tier Q4_K column), so the true achievable
+    floor is each quantizable tensor at its own smallest column -- the same
+    floor the per-tensor solver uses."""
     t = _load_cos(kind)
     if t is None:
         return None, None
     K = len(t["ladder"])
     upg = t["upg"]
-    cmin = float(t["C"][upg, 0].sum()) + t["c0"] + t["overhead"]
+    cmin = float(t["C"][upg].min(axis=1).sum()) + t["c0"] + t["overhead"]
     cmax = float(t["C"][upg, K - 1].sum()) + t["c0"] + t["overhead"]
     return cmin / 1e9, cmax / 1e9
 

@@ -116,17 +116,22 @@ IMATRIX_REQUIRED = {"IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S",
 # consume imatrix in the weighted quantize path, which a no-imatrix table
 # does not take); it can still be used for the FINAL llama-quantize step.
 LADDER_K = ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "F16"]
-LADDER_KINDS = {"k": LADDER_K, "full": None}    # None = ladder_for(imatrix)
 
 
 def ladder_for(use_imatrix, kind="full"):
     """The tier ladder a table uses for this (imatrix, ladder-kind) choice.
-    kind: 'k' -> LADDER_K (no imatrix tiers); 'full' -> LADDER trimmed by
-    the imatrix choice (the historical behaviour)."""
+    kind: 'k' -> LADDER_K (no imatrix tiers); 'full' -> the full LADDER
+    (all 15 tiers), regardless of the imatrix choice. The imatrix flag is
+    no longer used to trim the full ladder: the 6 imatrix-REQUIRED IQ tiers
+    are always present. A table built WITH an imatrix measures those tiers
+    as the real imatrix-weighted quants (per-tensor imatrix row); a table
+    built WITHOUT one measures them as the Q4_K fallback (the ggml kernel
+    aborts on the 6 tiers without an imx), so full tables are always built
+    with an imatrix (the GUI enforces it). The imatrix is also applied at
+    the final llama-quantize step."""
     if kind == "k":
         return list(LADDER_K)
-    return LADDER if use_imatrix else \
-        [t for t in LADDER if t not in IMATRIX_REQUIRED]
+    return list(LADDER)
 
 
 def group_of(name, quantizable=True):

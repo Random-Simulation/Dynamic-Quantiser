@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -82,18 +83,49 @@ def ceil32(n):
     return (int(n) + 31) & ~31
 
 
+# Extra candidate directories for llama.cpp binaries, prepended to the
+# built-in search. The GUI injects the user's "Binaries dir" here before
+# starting a worker thread; CLI users can also set
+# QUANTMAKER_BINARIES=C:\path\to\binaries.
+EXTRA_BIN_DIRS = []
+
+
+def tool_search_dirs():
+    """Candidate directories that may hold llama.cpp binaries, in priority
+    order: QUANTMAKER_BINARIES env var, EXTRA_BIN_DIRS (the user's
+    "Binaries dir" field), a binaries/ folder next to the app, and
+    (for frozen .exe builds) next to the executable."""
+    dirs = []
+    env = os.environ.get("QUANTMAKER_BINARIES")
+    if env:
+        dirs.append(Path(env))
+    dirs += [Path(d) for d in EXTRA_BIN_DIRS]
+    dirs += [APP_DIR / "binaries"]
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        dirs += [exe.parent, exe.parent / "_internal",
+                 exe.parent / "binaries"]
+    return dirs
+
+
 def find_tool(names, what):
-    """Search candidate locations for a llama.cpp binary / DLL."""
-    cands = [APP_DIR / "binaries", APP_DIR.parent / "binaries",
-             APP_DIR.parent / "app"]
-    for c in cands:
+    """Search candidate locations for a llama.cpp binary / DLL.
+    Raises RuntimeError when nothing is found -- deliberately NOT sys.exit,
+    because in a GUI worker thread a SystemExit is not caught by
+    `except Exception` and used to kill the thread silently, leaving the UI
+    frozen on 'Building ...' with zero CPU."""
+    for c in tool_search_dirs():
         for n in names:
             if (c / n).exists():
                 return c / n
     in_path = shutil.which(names[0])
     if in_path:
         return Path(in_path)
-    sys.exit(f"ERROR: {what} not found -- pass its path explicitly")
+    dirs = ", ".join(str(d) for d in tool_search_dirs())
+    raise RuntimeError(
+        f"{what} not found. Searched: {dirs} (and PATH). "
+        f"Put the binaries in one of those folders, set "
+        f"QUANTMAKER_BINARIES, or pass its path explicitly.")
 
 
 # --------------------------------------------------------------------------
@@ -180,9 +212,51 @@ class Quant:
 
 
 def load_imatrix(path):
-    """{tensor_name: f32 array} with the exact normalization of
-    tools/quantize/quantize.cpp load_imatrix (GGUF in_sum2/counts)."""
-    r = GGUFReader(str(path))
+    """{tensor_name: f32 row array} with the exact normalization of
+    tools/quantize/quantize.cpp load_imatrix. Accepts BOTH imatrix formats:
+    GGUF (.gguf: per-tensor .in_sum2/.counts, normalized by the per-chunk
+    counts) and the legacy .dat (llama-imatrix --output-format dat, see
+    _load_imatrix_dat) -- the GUI's 'Make imatrix' produces .dat, so both
+    must work for table builds."""
+    if str(path).lower().endswith(".dat"):
+        return _load_imatrix_dat(str(path))
+    return _load_imatrix_gguf(str(path))
+
+
+def _load_imatrix_dat(path):
+    """Legacy .dat imatrix (llama-imatrix --output-format dat):
+        i32 n_entries
+        per entry (sorted by name):
+            i32 len, name, i32 ncall, i32 nval, f32[nval] values
+        optional tail: i32 last_chunk, i32 len, dataset
+    The stored values are (sum2/count_chunk) * ncall; quantize.cpp's legacy
+    branch divides them by ncall, so we do the same: each entry becomes a
+    per-element mean sum-of-squares row with nval == ne[0] values -- the
+    same shape/semantics as the GGUF path, so the coverage rule
+    (row.size == n_per_row) and the kernel's imx usage are identical."""
+    d = Path(path).read_bytes()
+    n_entries, = struct.unpack_from("<i", d, 0)
+    pos = 4
+    out = {}
+    for _ in range(n_entries):
+        nl, = struct.unpack_from("<i", d, pos); pos += 4
+        name = d[pos:pos + nl].decode("utf-8"); pos += nl
+        ncall, nval = struct.unpack_from("<ii", d, pos); pos += 8
+        if nval < 1:
+            sys.exit(f"ERROR: imatrix {name} has no data")
+        vals = np.frombuffer(d, dtype=np.float32, count=nval,
+                             offset=pos).copy()
+        pos += 4 * nval
+        if ncall > 0:
+            vals = vals / ncall
+        out[name] = vals
+    return out
+
+
+def _load_imatrix_gguf(path):
+    """GGUF imatrix: {tensor_name: f32 array} with the exact normalization
+    of tools/quantize/quantize.cpp load_imatrix (in_sum2/counts)."""
+    r = GGUFReader(path)
     sums, counts = {}, {}
     for t in r.tensors:
         if t.name.endswith(".in_sum2"):       # 8-char suffix
@@ -629,7 +703,12 @@ def check_tier(source, imatrix, tier, dll, quantize, log=print):
             covered = row is not None and row.size == npr
             if row is not None and not covered:
                 row = None
-            lines.append(f"{t.name}={effective_type(tier, npr, covered, q.blck)}")
+            # Anchor+escape so each pattern matches ONLY its exact tensor
+            # (llama-quantize treats tensor-type-file names as regexes with
+            # substring first-match-wins -- see qmodel.schema_text). Without
+            # this, a shorter quantizable name could hijack a longer one and
+            # the byte-comparison gate would build a wrong reference.
+            lines.append(f"^{re.escape(t.name)}$={effective_type(tier, npr, covered, q.blck)}")
         schema.write_text("\n".join(lines) + "\n")
         if ref.exists():
             ref.unlink()
@@ -739,11 +818,17 @@ def main():
     if args.imatrix and not args.imatrix.exists():
         sys.exit(f"ERROR: imatrix not found: {args.imatrix}")
     if args.dll is None:
-        args.dll = find_tool(["ggml-base.dll", "libggml-base.so",
-                              "libggml-base.dylib"], "ggml-base")
+        try:
+            args.dll = find_tool(["ggml-base.dll", "libggml-base.so",
+                                  "libggml-base.dylib"], "ggml-base")
+        except RuntimeError as e:
+            sys.exit(f"ERROR: {e}")
     if args.quantize is None:
-        args.quantize = find_tool(["llama-quantize.exe", "llama-quantize"],
-                                  "llama-quantize")
+        try:
+            args.quantize = find_tool(
+                ["llama-quantize.exe", "llama-quantize"], "llama-quantize")
+        except RuntimeError as e:
+            sys.exit(f"ERROR: {e}")
     ladder = _ladder_for(args, None)
 
     if args.check_tier:

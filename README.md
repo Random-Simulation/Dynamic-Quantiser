@@ -52,4 +52,3 @@ assignment under a target size / target deviation, and hand the resulting
 - `fastq.py` / `fastq.c` / `fastq.dll` -- fused build kernel + bindings
 - `build_fastq.py` -- compiles the kernel
 - `QuantMaker.spec` -- PyInstaller spec (`build/` + `dist/` are outputs)
-- `deleteme/` -- dead files + superseded tests, staged for deletion

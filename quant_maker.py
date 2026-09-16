@@ -7,19 +7,23 @@ optionally bump whole layers up a tier or two, watch the expected size and
 whole-model weight-space cosine update live, then:
 
   * "Make custom quant"   -> writes schema.txt and runs llama-quantize
-  * "Make dynamic quant"  -> full per-tensor solver, then runs llama-quantize
+  * "Make dynamic quant"  -> per-tensor solver, then runs llama-quantize
   * "Minimise cosine deviation" / "Minimise disk size" -> group-level solvers
-  * "Build table"         -> builds the cosine table in a worker thread
+  * "Build table"         -> builds the fast K-ladder cosine table in a
+                             worker thread
 
 No model is hardcoded: the source path drives table lookup and the
-"Build table" button builds a table in a worker thread (resumable,
-cancellable) with the current imatrix setting. Only cosine + deviation are
-shown (there is no KLD). Run:  python quant_maker.py
+"Build table" button builds the fast K-ladder table (Q2_K to Q8_0 + F16,
+NO IQ_X tiers) in a worker thread (resumable, cancellable). Only the fast
+K quants are ever built or used, so the per-tensor / group-level solvers
+can only pick fast tiers -- they never see IQ_X. Only cosine + deviation
+are shown (there is no KLD). Run:  python quant_maker.py
 """
 import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -44,43 +48,35 @@ STATE_PATH = APP_DIR / "state.json"     # paths/settings, no model defaults
 MINIMISE_BTN_WIDTH_PX = 170              # shared width for the two minimise buttons
 
 
-def _find_quantize():
-    """llama-quantize: project binaries/, llama.cpp binaries/, app/, PATH."""
+def _find_bin(name, extra_dir=None):
+    """Find `name` (+ .exe) in: the user's Binaries dir, a binaries/ folder
+    next to the app / .exe, and finally PATH."""
     import shutil
-    cands = [APP_DIR / "binaries", APP_DIR.parent / "binaries",
-             APP_DIR.parent / "app"]
-    names = ["llama-quantize.exe", "llama-quantize"]
+    names = [name + ".exe", name]
+    cands = []
+    if extra_dir:
+        cands.append(Path(extra_dir))
+    cands += [APP_DIR / "binaries"]
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        cands += [exe.parent, exe.parent / "binaries"]
     for c in cands:
         for n in names:
             if (c / n).exists():
                 return c / n
-    p = shutil.which("llama-quantize")
+    p = shutil.which(names[0])
     return Path(p) if p else None
 
 
-QUANTIZE_EXE = _find_quantize()
-
-
-def _find_imatrix():
-    """llama-imatrix: project binaries/, llama.cpp binaries/, app/, PATH."""
-    import shutil
-    cands = [APP_DIR / "binaries", APP_DIR.parent / "binaries",
-             APP_DIR.parent / "app"]
-    names = ["llama-imatrix.exe", "llama-imatrix"]
-    for c in cands:
-        for n in names:
-            if (c / n).exists():
-                return c / n
-    p = shutil.which("llama-imatrix")
-    return Path(p) if p else None
-
-
-IMATRIX_EXE = _find_imatrix()
+# startup lookup (no user dir yet); the GUI re-resolves dynamically via
+# _quantize_exe/_imatrix_exe once the Binaries dir field is available.
+QUANTIZE_EXE = _find_bin("llama-quantize")
+IMATRIX_EXE = _find_bin("llama-imatrix")
 
 # no model-specific defaults: the user always selects a source
 DEFAULTS = {"source": "", "output": str(APP_DIR / "custom_quant.gguf"),
             "imatrix": "", "calib": "",
-            "imx_out": str(APP_DIR / "imatrix.dat")}
+            "imx_out": str(APP_DIR / "imatrix.dat"), "binaries": ""}
 
 
 class App:
@@ -99,8 +95,8 @@ class App:
         self._numpy_warned = False     # only warn about missing numpy once
 
         root.title("Quant Maker")
-        root.geometry("500x960")
-        root.minsize(500, 960)
+        root.geometry("500x1000")
+        root.minsize(500, 1000)
         style = ttk.Style(root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
@@ -198,7 +194,6 @@ class App:
             "groups": {g: v.get() for g, v in self.group_vars.items()},
             "layers": self.layers_var.get(),
             "imx": self.imx_on.get(),
-            "build_kind": self.build_kind.get() if self.build_kind else "k",
             "target": self.target_var.get(),
             "dev": self.dev_var.get(),
             "source": self.src_var.get(),
@@ -206,6 +201,7 @@ class App:
             "imatrix": self.imx_var.get(),
             "calib": self.calib_var.get(),
             "imx_out": self.imx_out_var.get(),
+            "binaries": self.bin_var.get(),
         }
 
     def _save_state(self):
@@ -236,15 +232,14 @@ class App:
             self.layers_var.set(st["layers"])
         if isinstance(st.get("imx"), bool):
             self.imx_on.set(st["imx"])
-        if st.get("build_kind") in ("k", "full"):
-            self.build_kind.set(st["build_kind"])
         for key, var in (("target", self.target_var),
                          ("dev", self.dev_var),
                          ("source", self.src_var),
                          ("output", self.out_var),
                          ("imatrix", self.imx_var),
                          ("calib", self.calib_var),
-                         ("imx_out", self.imx_out_var)):
+                         ("imx_out", self.imx_out_var),
+                         ("binaries", self.bin_var)):
             if isinstance(st.get(key), str):
                 var.set(st[key])
         # remember per-group tiers; applied on the next group rebuild
@@ -397,6 +392,16 @@ class App:
                                                      "GGUF imatrix"
                                                      )).grid(
             row=2, column=2, sticky="e", padx=(4, 0), pady=2)
+        # Folder holding the llama.cpp binaries (ggml-base.dll, llama-
+        # quantize.exe, llama-imatrix.exe). Empty = auto-search.
+        self.bin_var = path_row(3, "Binaries", DEFAULTS["binaries"])
+        ttk.Button(p, text="...", width=3, style="Small.TButton",
+                   command=self._browse_bin_dir).grid(
+            row=3, column=2, sticky="e", padx=(4, 0), pady=2)
+        ttk.Label(p, text="ggml-base.dll + llama-quantize.exe + "
+                          "llama-imatrix.exe",
+                  style="Hint.TLabel").grid(
+            row=4, column=1, sticky="w", pady=(0, 2))
 
         ttk.Separator(f, orient="horizontal").grid(row=1, column=0,
                                                    columnspan=2,
@@ -414,20 +419,10 @@ class App:
         self.err_lbl = ttk.Label(f, text="", foreground="#b00020",
                                  wraplength=340, justify="left")
         self.err_lbl.grid(row=5, column=0, columnspan=2, sticky="w")
-        mk = ttk.Frame(f)
-        mk.grid(row=7, column=0, columnspan=2, sticky="we", pady=(8, 0))
-        ttk.Label(mk, text="Table build:").pack(side="left")
-        self.build_kind = tk.StringVar(value="k")
-        ttk.Radiobutton(mk, text="Fast (k Quants only Q2_k to Q8_0)",
-                        variable=self.build_kind, value="k",
-                        command=self._on_table_changed).pack(
-            side="left", padx=(4, 6))
-        ttk.Radiobutton(mk, text="Full (includes IQ_X quants)",
-                        variable=self.build_kind, value="full",
-                        command=self._on_table_changed).pack(side="left")
-
+        # Fast K-ladder table only (Q2_K to Q8_0 + F16, no IQ_X tiers):
+        # there is no table-type choice to make, just the build button.
         bk = ttk.Frame(f)
-        bk.grid(row=8, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        bk.grid(row=7, column=0, columnspan=2, sticky="we", pady=(8, 0))
         self.btn_table = ttk.Button(bk, text="Build table",
                                     style="Small.TButton",
                                     command=self.build_table)
@@ -438,7 +433,7 @@ class App:
         self.tbl_lbl.pack(side="left", padx=(8, 0))
 
         # Imatrix generation section
-        ig = ttk.LabelFrame(f, text="  Imatrix generation  ", padding=6)
+        ig = ttk.LabelFrame(f, text="  Imatrix generation (requires calibration data) ", padding=6)
         ig.grid(row=9, column=0, columnspan=2, sticky="we", pady=(6, 0))
         ig.columnconfigure(1, weight=1)
 
@@ -498,7 +493,7 @@ class App:
         ln2 = ttk.Frame(hb)
         ln2.pack(fill="x", anchor="w", pady=(2, 0))
         ttk.Label(ln2, text="Dynamic quant - solves dynamically at the "
-                            "tensor level (most accurate). "
+                            "tensor level for target size (most accurate). "
                             , style="Hint.TLabel").pack(
             side="left", anchor="w")
 
@@ -554,6 +549,14 @@ class App:
         if p:
             self.calib_var.set(p)
 
+    def _browse_bin_dir(self):
+        p = filedialog.askdirectory(
+            parent=self.root,
+            title="Select the folder with the llama.cpp binaries",
+            initialdir=str(APP_DIR))
+        if p:
+            self.bin_var.set(p)
+
     def _browse_imx_out(self):
         cur = self.imx_out_var.get().strip()
         curdir = os.path.dirname(cur)
@@ -573,8 +576,8 @@ class App:
         t = q._load_cos(self._active_kind())
         if t is not None:
             return t["ladder"]
-        return q.ladder_for(self._active_kind() == "imatrix",
-                            self.build_kind.get())
+        # Fast K-ladder only: the app never builds/uses a full (IQ_X) table.
+        return q.ladder_for(self._active_kind() == "imatrix")
 
     def _schedule_model(self):
         """Debounce the source field so the GGUF is only read once per
@@ -588,8 +591,7 @@ class App:
         if self._loading:
             return
         src = self.src_var.get().strip()
-        key = (src, self.imx_var.get().strip(), self.imx_on.get(),
-               self.build_kind.get())
+        key = (src, self.imx_var.get().strip(), self.imx_on.get())
         if src and Path(src).exists():
             st = Path(src).stat()
             key = key + (int(st.st_mtime),)
@@ -598,7 +600,8 @@ class App:
             return
         self._model_src = key
         imx = self.imx_var.get().strip()
-        q.set_build_kind(self.build_kind.get())
+        # Fast K-ladder only (the app never selects a full/IQ_X table).
+        q.set_build_kind("k")
         m = q.set_table_source(src if (src and Path(src).exists()) else None,
                                imx if (imx and Path(imx).exists()) else None)
         # the model changed: clear any stale display + validate the saved
@@ -731,8 +734,10 @@ class App:
     def _target_range_ok(self):
         lo, hi = q.size_bounds(self._active_kind())
         if lo is None:
-            self.err_lbl.config(text="no cosine table -- 'Build table' "
-                                     "first")
+            messagebox.showwarning(
+                "No cosine table",
+                "No cosine table for this source --\n"
+                "press 'Build table' first.")
             return None
         return lo, hi
 
@@ -860,12 +865,25 @@ class App:
             return
         if not self._check_numpy("The per-tensor solver"):
             return
+        out = self.out_var.get().strip()
+        if not self._confirm_overwrite(out, "Output file"):
+            return
         rng = self._target_range_ok()
         if rng is None:
             return
         lo, hi = rng
+        raw = self.target_var.get().strip()
+        if not raw:
+            messagebox.showerror(
+                "No target size",
+                "The 'Target size on disk (GB)' field is empty.\n\n"
+                f"Enter a target size in GB between {lo:.2f} and "
+                f"{hi:.2f}.\n\n"
+                "Tip: fill it in first with 'Minimise cosine\n"
+                "deviation', then press 'Make dynamic quant'.")
+            return
         try:
-            target = float(self.target_var.get())
+            target = float(raw)
         except ValueError:
             self.err_lbl.config(
                 f"enter a target size in GB ({lo:.2f}..{hi:.2f})")
@@ -937,8 +955,18 @@ class App:
                 self._log(f"[full  ] {g:12s} {dist}")
 
     # --------------------------------------------------------------- quant
+    def _bin_dir(self):
+        d = self.bin_var.get().strip()
+        return d if d else None
+
+    def _quantize_exe(self):
+        return _find_bin("llama-quantize", self._bin_dir())
+
+    def _imatrix_exe(self):
+        return _find_bin("llama-imatrix", self._bin_dir())
+
     def _build_command(self):
-        cmd = [str(QUANTIZE_EXE or "llama-quantize")]
+        cmd = [str(self._quantize_exe() or "llama-quantize")]
         if self.imx_on.get():
             cmd += ["--imatrix", self.imx_var.get().strip()]
         cmd += ["--tensor-type-file", str(SCHEMA),
@@ -979,11 +1007,11 @@ class App:
             self.err_lbl.config(
                 text=f"output directory does not exist:\n{out_parent}")
             return False
-        if QUANTIZE_EXE is None:
+        if self._quantize_exe() is None:
             self.err_lbl.config(text=(
                 "llama-quantize not found.\n"
-                "Put it in <project>\\binaries or "
-                "add it to PATH, then restart."))
+                "Set the 'Binaries dir' field (or put the binaries in "
+                "<project>\\binaries / add them to PATH)."))
             return False
         return True
 
@@ -998,14 +1026,14 @@ class App:
                 "Select a source GGUF model file first.\n"
                 "Fill in the Source field or click '...' to browse.")
             return
+        out = self.out_var.get().strip()
+        if not self._confirm_overwrite(out, "Output file"):
+            return
         if rows is None:
             rows, err = self._current_config()
             if rows is None:
                 return
         if not self._validate_quant_paths():
-            return
-        out = self.out_var.get().strip()
-        if not self._confirm_overwrite(out, "Output file"):
             return
         if not self._write_schema(rows):
             return
@@ -1047,7 +1075,7 @@ class App:
 
     # ---------------------------------------------------------- imatrix gen
     def _build_imatrix_cmd(self):
-        cmd = [str(IMATRIX_EXE or "llama-imatrix")]
+        cmd = [str(self._imatrix_exe() or "llama-imatrix")]
         cmd += ["-m", self.src_var.get().strip()]
         cmd += ["-f", self.calib_var.get().strip()]
         cmd += ["-o", self.imx_out_var.get().strip()]
@@ -1103,11 +1131,11 @@ class App:
                 text=f"imatrix output directory does not exist:\n"
                      f"{out_parent}")
             return
-        if IMATRIX_EXE is None:
+        if self._imatrix_exe() is None:
             self.err_lbl.config(text=(
                 "llama-imatrix not found.\n"
-                "Put it in <project>\\binaries or "
-                "add it to PATH, then restart."))
+                "Set the 'Binaries dir' field (or put the binaries in "
+                "<project>\\binaries / add them to PATH)."))
             return
         if not self._confirm_overwrite(out, "Imatrix output file"):
             return
@@ -1153,8 +1181,10 @@ class App:
 
     # ----------------------------------------------------------- table build
     def build_table(self):
-        """Run the in-process cosine-table builder for the current source +
-        imatrix checkbox, in a worker thread. Resumable, cancellable."""
+        """Build the fast K-ladder cosine table (Q2_K to Q8_0 + F16, no
+        IQ_X tiers) for the current source, in a worker thread. The K
+        ladder never uses imatrix for the table (imatrix applies to the
+        final llama-quantize step). Resumable, cancellable."""
         if self.proc_running:
             self._show_busy("Process")
             return
@@ -1162,10 +1192,9 @@ class App:
             self._show_busy("Table build")
             return
         src = self.src_var.get().strip()
-        imx_on = self.imx_on.get()
-        imx = self.imx_var.get().strip()
-        kind = self.build_kind.get()
-        use_im = imx_on and kind == "full"     # K tables never use imatrix
+        # Fast K-ladder table only (Q2_K to Q8_0 + F16, no IQ_X tiers).
+        # The K ladder never uses imatrix for the table -- imatrix applies
+        # to the final llama-quantize step, not the K-ladder build.
         if not src:
             messagebox.showwarning(
                 "No source model",
@@ -1189,50 +1218,47 @@ class App:
         except OSError as e:
             self.err_lbl.config(text=f"cannot read source file: {e}")
             return
-        if use_im:
-            if not imx:
-                self.err_lbl.config(text=(
-                    "'Use imatrix' is checked and build kind is 'Full',\n"
-                    "but no imatrix file is specified.\n"
-                    "Fill in the Imatrix field or untick the checkbox."))
-                return
-            if not Path(imx).exists():
-                self.err_lbl.config(
-                    text=f"imatrix file not found: {imx}")
-                return
+        kind = "k"
         out = tablestore.TABLES_DIR / tablestore.table_filename(
-            src, use_im, kind)
+            src, False, kind)
+        bin_dir = self._bin_dir()
+        tablebuild.EXTRA_BIN_DIRS = [bin_dir] if bin_dir else []
         self.err_lbl.config(text="")
         for b in self.all_btns:
             b.config(state="disabled")
         self.btn_table.config(text="Building ...")
         self.tbl_running = True
         self.tbl_cancel = False
-        mode = ("fast K ladder" if kind == "k"
-                else "full ladder" + (", imatrix" if use_im else ""))
-        self._log(f"[table ] building {out.name} ({mode}) "
+        self._log(f"[table ] building {out.name} (fast K ladder) "
                   f"from {src} -- resumable, see log")
-        threading.Thread(target=self._run_table_build,
-                         args=(src, imx if use_im else None, out, kind),
+        threading.Thread(target=self._run_table_build, args=(src, out),
                          daemon=True).start()
 
-    def _run_table_build(self, src, imx, out, kind):
+    def _run_table_build(self, src, out):
+        # BaseException on purpose: besides ordinary errors this catches
+        # SystemExit (a sys.exit inside a worker thread used to die here
+        # silently, leaving the UI stuck on 'Building ...' with zero CPU)
+        # and KeyboardInterrupt. table_done is ALWAYS queued so the UI
+        # recovers either way. Fast K ladder only (no imatrix tiers).
         try:
             os.environ["OPENBLAS_NUM_THREADS"] = "1"
             dll = tablebuild.find_tool(["ggml-base.dll", "libggml-base.so",
                                         "libggml-base.dylib"], "ggml-base")
-            lad = modeldef.ladder_for(imx is not None, kind)
+            lad = modeldef.LADDER_K
             n_thr = os.cpu_count() or 4
             self.logq.put(
                 f"[table ] C++ fused engine, {n_thr} threads, "
                 f"{len(lad)} tiers: {', '.join(lad)}")
-            b = tablebuild2.Build(src, imx, dll, lad, out, workers=n_thr,
+            b = tablebuild2.Build(src, None, dll, lad, out, workers=n_thr,
                                   log=lambda m: self.logq.put(m))
             ok = b.run(cancel=lambda: self.tbl_cancel)
             self.jobq.put(("table_done", ok, out.name))
-        except Exception as e:      # noqa: BLE001
-            self.logq.put(f"[table ] ERROR: {e}")
-            self.jobq.put(("table_done", False, ""))
+        except BaseException as e:      # noqa: BLE001
+            import traceback
+            self.logq.put(f"[table ] ERROR: {type(e).__name__}: {e}")
+            for line in traceback.format_exc().splitlines()[-4:]:
+                self.logq.put("    " + line)
+            self.jobq.put(("table_done", False, out.name))
 
     # ------------------------------------------------------------ job pump
     def _poll_jobs(self):
@@ -1273,6 +1299,10 @@ class App:
                     else:
                         self._log("[table ] FAILED -- checkpoint kept, "
                                   "press 'Build table' to resume")
+                        self.err_lbl.config(
+                            text="Table build failed -- press "
+                                 "'Show terminal' for the error, then "
+                                 "'Build table' to resume")
                     for b in self.all_btns:
                         b.config(state="normal")
                     self._on_model_changed()

@@ -1,19 +1,39 @@
 """fastq.py -- ctypes bindings for fastq.dll (fused table-build kernel).
 
 FastQ loads fastq.dll and (through it) the project's ggml-base.dll.
-  quant(tname, a, npr, imx)     -> raw bytes, bit-exact with llama-quantize
   segment(a, npr, types, imx)   -> (A, S, Q) fused f64 stats for one
                                    256M-elem-or-smaller segment, all tiers
 Enums and sizes mirror tablebuild.py (same ggml.h values).
 """
 import ctypes
-from ctypes import (POINTER, c_float, c_int, c_int64, c_size_t, c_void_p,
-                    c_uint8, c_double)
+import sys
+from ctypes import (POINTER, c_float, c_int, c_int64, c_uint8, c_double)
 from pathlib import Path
 
 import numpy as np
 
 APP_DIR = Path(__file__).resolve().parent
+
+
+def _find_fastq():
+    """Locate fastq.dll: next to the module, next to the frozen .exe (and
+    its _internal / binaries subdirs), or in a project binaries dir."""
+    cands = [APP_DIR / "fastq.dll"]
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        cands += [exe.parent / "fastq.dll",
+                  exe.parent / "_internal" / "fastq.dll",
+                  exe.parent / "binaries" / "fastq.dll"]
+    cands += [APP_DIR.parent / "fastq.dll",
+              APP_DIR / "binaries" / "fastq.dll"]
+    for c in cands:
+        if c.exists():
+            return c
+    raise RuntimeError(
+        "fastq.dll not found. Searched: "
+        + ", ".join(str(c) for c in cands)
+        + ". Rebuild the .exe with fastq.dll bundled, or copy fastq.dll "
+          "next to the app.")
 
 # ggml enums (ggml.h, stable) -- superset: ladder + fallback types
 ENUM = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7,
@@ -22,12 +42,10 @@ ENUM = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7,
         "IQ1_S": 19, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22,
         "IQ4_XS": 23, "IQ1_M": 29}
 
-SEG_MAX = 256_000_000        # elements per kernel call (memory cap)
-
 
 class FastQ:
     def __init__(self, ggml_dll):
-        lib = ctypes.CDLL(str(APP_DIR / "fastq.dll"))
+        lib = ctypes.CDLL(str(_find_fastq()))
         self._lib = lib
         lib.fq_init.argtypes = [ctypes.c_char_p]
         lib.fq_init.restype = c_int
@@ -35,10 +53,6 @@ class FastQ:
         lib.fq_blck_size.restype = c_int
         lib.fq_type_size.argtypes = [c_int]
         lib.fq_type_size.restype = c_int
-        lib.fq_quant.argtypes = [POINTER(c_float), c_int64, c_int64, c_int,
-                                 POINTER(c_float), POINTER(c_uint8),
-                                 c_size_t]
-        lib.fq_quant.restype = c_size_t
         lib.fq_segment.argtypes = [POINTER(c_float), c_int64, c_int64,
                                    POINTER(c_int), c_int, POINTER(c_float),
                                    POINTER(c_double), POINTER(c_double),
@@ -49,22 +63,6 @@ class FastQ:
             raise RuntimeError(f"fastq: failed to load {ggml_dll}")
         self.blck = {t: lib.fq_blck_size(e) for t, e in ENUM.items()}
         self.rowb = {t: lib.fq_type_size(e) for t, e in ENUM.items()}
-
-    def quant(self, tname, a, npr, imx):
-        """raw quantized bytes (bit-exact with llama-quantize)."""
-        t = ENUM[tname]
-        bs, rb = self.blck[tname], self.rowb[tname]
-        n = a.size
-        buf = np.empty((n // bs) * rb, np.uint8)
-        imxp = (imx.ctypes.data_as(POINTER(c_float))
-                if imx is not None else None)
-        rc = self._lib.fq_quant(a.ctypes.data_as(POINTER(c_float)), n,
-                                c_int64(npr), t, imxp,
-                                buf.ctypes.data_as(POINTER(c_uint8)),
-                                buf.size)
-        if rc != buf.size:
-            raise RuntimeError(f"fastq.quant {tname}: rc={rc}")
-        return buf
 
     def segment(self, a, npr, tnames, imx):
         """Fused stats for one segment. tnames: list of ggml type names

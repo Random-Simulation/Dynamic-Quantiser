@@ -70,11 +70,13 @@ def solve(target_gb, use_imatrix=False):
     # already bakes every frozen tensor exactly, so no per-tensor adjust.
     frozen = t["c0"]
     B = target_gb * 1e9 - frozen - t["overhead"]
-    min_cost = float(CG[:, 0].sum())
+    # per-group floor = each group at its OWN smallest tier (col 0 may not
+    # be the true min when imatrix-required IQ tiers fall back to a K tier).
+    min_cost = float(CG.min(axis=1).sum())
     if B < min_cost:
         return None, (f"target {target_gb:g} GB is below the minimum "
                       f"({(min_cost + frozen + t['overhead'])/1e9:.2f} GB, "
-                      "all groups IQ1_S)")
+                      "smallest tier per group)")
 
     def cosval(Su, Qu):
         return (Su + s0) / np.sqrt(A * (Qu + q0))
@@ -253,7 +255,7 @@ def solve_min_size(target_cos, use_imatrix=False, tol_gb=0.05):
 
     SG, QG, CG, SL, QL, CL = _matrices(t)
     frozen = t["c0"]
-    lo = (float(CG[:, 0].sum()) + frozen + t["overhead"]) / 1e9
+    lo = (float(CG.min(axis=1).sum()) + frozen + t["overhead"]) / 1e9
 
     res, err = solve(lo, use_imatrix)
     if res is None:

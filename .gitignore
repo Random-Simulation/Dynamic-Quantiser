@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+build_env/
 
 # PyInstaller
 build/
@@ -21,8 +22,3 @@ imatrix.dat
 *.gguf
 tables/
 refs_tmp/
-
-# Scratch / one-off files
-deleteme/
-results.txt
-tree.txt

@@ -12,6 +12,14 @@ cheap container-overhead read from the source header (no re-quantize --
 see tablebuild.Build.measure_overhead), sanity. Ladders: modeldef.LADDER_K
 (fast, no imatrix) or the full LADDER (imatrix build).
 
+The full ladder includes the 6 imatrix-REQUIRED IQ tiers. When an imatrix
+is provided those tiers are measured as the REAL imatrix-weighted quants
+(per-tensor imatrix row passed to the kernel); a tensor without an imatrix
+row (e.g. MTP) falls back to Q4_K for them. Without an imatrix they all
+measure as Q4_K -- so a full table is ALWAYS built with an imatrix (the
+GUI enforces it), otherwise the 6 IQ columns are Q4_K clones and the size
+bounds are wrong.
+
 Measured cost per element (Zen 2, ref/no-imatrix path ~2x faster than the
 weighted path): K ladder ~0.5 us/elem -> 27B in ~25-40 min at 12 threads;
 full ladder ~4 us/elem -> ~3-5 h.
@@ -53,13 +61,18 @@ DEFAULT_SEG = 64_000_000     # elements per kernel call (memory cap)
 _tls = threading.local()
 
 
-def _get_ctx(source, dll, seg_max):
-    """Per-thread context (GGUFReader memmap + fastq handle)."""
+def _get_ctx(source, dll, seg_max, imatrix):
+    """Per-thread context (GGUFReader memmap + fastq handle + imatrix rows).
+    Keyed on (source, dll, seg_max, imatrix) so a thread reused for a
+    different build re-loads instead of serving stale data."""
+    key = (source, dll, seg_max, imatrix)
     ctx = getattr(_tls, "ctx", None)
-    if ctx is None:
-        ctx = {"reader": GGUFReader(str(source)),
+    if ctx is None or ctx.get("key") != key:
+        ctx = {"key": key,
+               "reader": GGUFReader(str(source)),
                "fq": fastq.FastQ(dll),
-               "seg_max": seg_max}
+               "seg_max": seg_max,
+               "imx": tablebuild.load_imatrix(imatrix) if imatrix else None}
         _tls.ctx = ctx
     return ctx
 
@@ -78,11 +91,11 @@ def _f32_rows(t, r0, r1):
     sys.exit(f"ERROR: unsupported source tensor type {tt} ({t.name})")
 
 
-def _do_batch(tids, source, dll, ladder, frozen, seg_max):
+def _do_batch(tids, source, dll, ladder, frozen, seg_max, imatrix):
     """Process one batch of tensor indices with the fused kernel; returns
     the same tuple as tablebuild._do_batch (so Build.merge works)."""
-    ctx = _get_ctx(source, dll, seg_max)
-    r, fq = ctx["reader"], ctx["fq"]
+    ctx = _get_ctx(source, dll, seg_max, imatrix)
+    r, fq, imx = ctx["reader"], ctx["fq"], ctx["imx"]
     blck, rowb = fq.blck, fq.rowb
     J = len(ladder)
     n = len(tids)
@@ -103,12 +116,23 @@ def _do_batch(tids, source, dll, ladder, frozen, seg_max):
         npr = int(t.shape[0])             # ggml ne[0]
         nrows = int(t.n_elements) // npr
         ntot = nrows * npr
-        # per-tier effective type (shape fallback only; the K ladder has no
-        # imatrix tiers, a full ladder passes covered=True -- the parent
-        # engine semantics with imatrix rows are the reference there)
+        # imatrix coverage for this tensor (llama-quantize rules): an
+        # imatrix row holds npr values, one per element of a row. A tensor
+        # without a matching row (e.g. MTP) has the 6 IMATRIX_REQUIRED IQ
+        # tiers fall back to Q4_K -- the kernel aborts (fq_gate case 2)
+        # if it is sent an imatrix-required type without an imx. WITH a
+        # row, every tier is measured as the REAL quant it is (the 6 IQ
+        # tiers imatrix-weighted) -- passing row=None here used to silently
+        # turn all 6 of those columns into Q4_K clones.
+        row = imx.get(t.name) if imx else None
+        covered = row is not None and row.size == npr
+        if row is not None and not covered:
+            warns.append(f"{t.name}: imatrix size {row.size} != n_per_row "
+                         f"{npr}; treated as uncovered")
+            row = None
         effs = []
         for T in ladder[:-1]:
-            eff = tablebuild.effective_type(T, npr, True, blck)
+            eff = tablebuild.effective_type(T, npr, covered, blck)
             if eff != T:
                 fb[T] += 1
             effs.append(eff)
@@ -123,7 +147,7 @@ def _do_batch(tids, source, dll, ladder, frozen, seg_max):
             r1 = min(nrows, r0 + rows_per_seg)
             a = _f32_rows(t, r0, r1)
             A, S, Q, (s16seg, q16seg, ok16) = \
-                fq.segment(a, npr, tnames, None)
+                fq.segment(a, npr, tnames, row)
             Aacc += A
             for j in range(J - 1):
                 if effs[j] != "F16":
@@ -201,7 +225,8 @@ class Build(tablebuild.Build):
             self.log(f"{len(todo)} tensors in {len(batches)} batches, "
                      f"{self.workers} thread(s), seg={self.seg // 1e6}M")
             args = (str(self.source), str(self.dll), self.ladder,
-                    self.meta["frozen"].tolist(), self.seg)
+                    self.meta["frozen"].tolist(), self.seg,
+                    str(self.imatrix) if self.imatrix else None)
             bt0_all = time.time()
             b_times = []
             if self.workers <= 1:
@@ -286,8 +311,12 @@ def main():
     if args.imatrix and not args.imatrix.exists():
         sys.exit(f"ERROR: imatrix not found: {args.imatrix}")
     if args.dll is None:
-        args.dll = tablebuild.find_tool(["ggml-base.dll", "libggml-base.so",
-                                         "libggml-base.dylib"], "ggml-base")
+        try:
+            args.dll = tablebuild.find_tool(
+                ["ggml-base.dll", "libggml-base.so", "libggml-base.dylib"],
+                "ggml-base")
+        except RuntimeError as e:
+            sys.exit(f"ERROR: {e}")
     if args.ladder:
         lad = [t.strip() for t in args.ladder.split(",") if t.strip()]
         if lad[-1] != "F16" or any(t not in modeldef.LADDER for t in lad):
