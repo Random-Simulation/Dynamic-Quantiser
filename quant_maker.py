@@ -97,6 +97,9 @@ class App:
         self._src_after = None         # debounce timer for the source field
         self._loading = False          # suppress rebuilds while restoring state
         self._numpy_warned = False     # only warn about missing numpy once
+        self.proc = None               # active subprocess (quant/imatrix)
+        self._stopped = False          # user pressed Stop
+        self._stop_info = None         # (button, text, command) to restore
 
         root.title("Dynamic Quantiser")
         root.geometry("500x1000")
@@ -131,7 +134,7 @@ class App:
         bottom.pack(fill="x", pady=(8, 0))
         self._build_right_frame(bottom)
 
-        self._build_log(body.pack(fill="x", pady=(8, 0)))
+        self._build_log(body)
 
         self._load_state()
         self._on_model_changed()
@@ -932,7 +935,7 @@ class App:
                 b.config(state="normal")
             return
         self._show_per_tensor(rows, res)
-        self._start_quantize()
+        self._start_quantize(self.btn_min_quant)
 
     def make_min_cos_quant(self):
         self._full_solve_then()
@@ -1043,29 +1046,34 @@ class App:
             return
         self._log(f"[schema] wrote {SCHEMA}  ({len(rows)} tensors, "
                   f"{q.gb(q.expected_bytes(rows)):.3f} GB)")
-        self._start_quantize()
+        self._start_quantize(self.btn_quant)
 
-    def _start_quantize(self):
+    def _start_quantize(self, stop_btn=None):
         cmd = self._build_command()
         cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
         self._log(f"[quant ] {cmd_str}")
         for b in self.all_btns:
             b.config(state="disabled")
+        if stop_btn is not None:
+            self._set_stop(stop_btn)
         self.proc_running = True
         threading.Thread(target=self._run_quantize, args=(cmd,),
                          daemon=True).start()
 
     def _run_quantize(self, cmd):
         try:
-            proc = subprocess.Popen(cmd, cwd=str(APP_DIR),
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True,
-                                    errors="replace")
+            self.proc = subprocess.Popen(cmd, cwd=str(APP_DIR),
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         text=True, errors="replace")
+            proc = self.proc
             for line in proc.stdout:
                 self._log(line.rstrip())
             rc = proc.wait()
             self._log(f"[quant ] exit code {rc}")
-            if rc == 0:
+            if self._stopped:
+                self._log(f"[quant ] stopped by user")
+            elif rc == 0:
                 self._log(f"[quant ] done -> {self.out_var.get()}")
             else:
                 self._log(f"[quant ] FAILED (rc={rc})")
@@ -1074,6 +1082,7 @@ class App:
             self._log(f"[quant ] ERROR: {e}")
             self.jobq.put(("quant_fail", str(e)))
         finally:
+            self.proc = None
             self.proc_running = False
             self.jobq.put(("quant_done",))
 
@@ -1149,22 +1158,25 @@ class App:
         self.err_lbl.config(text="")
         for b in self.all_btns:
             b.config(state="disabled")
-        self.btn_imatrix.config(text="Making ...")
+        self._set_stop(self.btn_imatrix)
         self.proc_running = True
         threading.Thread(target=self._run_imatrix, args=(cmd,),
                          daemon=True).start()
 
     def _run_imatrix(self, cmd):
         try:
-            proc = subprocess.Popen(cmd, cwd=str(APP_DIR),
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True,
-                                    errors="replace")
+            self.proc = subprocess.Popen(cmd, cwd=str(APP_DIR),
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         text=True, errors="replace")
+            proc = self.proc
             for line in proc.stdout:
                 self._log(line.rstrip())
             rc = proc.wait()
             self._log(f"[imatrix] exit code {rc}")
-            if rc == 0:
+            if self._stopped:
+                self._log(f"[imatrix] stopped by user")
+            elif rc == 0:
                 out = self.imx_out_var.get().strip()
                 try:
                     sz = Path(out).stat().st_size / (1024 * 1024)
@@ -1180,8 +1192,36 @@ class App:
             self._log(f"[imatrix] ERROR: {e}")
             self.jobq.put(("imatrix_fail", str(e)))
         finally:
+            self.proc = None
             self.proc_running = False
             self.jobq.put(("imatrix_done",))
+
+    # ------------------------------------------------------------- stop
+    def _set_stop(self, btn):
+        """Turn a button into a Stop button (remembers original state)."""
+        self._stop_info = (btn, btn.cget("text"), btn.cget("command"))
+        btn.config(text="Stop", command=self._stop_process, state="normal")
+
+    def _restore_stop(self):
+        """Restore the stop button to its original text/command."""
+        if self._stop_info:
+            btn, text, cmd = self._stop_info
+            btn.config(text=text, command=cmd)
+            self._stop_info = None
+        self._stopped = False
+
+    def _stop_process(self):
+        """Stop the running table build or subprocess."""
+        self._stopped = True
+        if self.tbl_running:
+            self.tbl_cancel = True
+            self._log("[stop  ] table build stop requested")
+        if self.proc is not None:
+            self._log("[stop  ] killing subprocess")
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
 
     # ----------------------------------------------------------- table build
     def build_table(self):
@@ -1230,7 +1270,7 @@ class App:
         self.err_lbl.config(text="")
         for b in self.all_btns:
             b.config(state="disabled")
-        self.btn_table.config(text="Building ...")
+        self._set_stop(self.btn_table)
         self.tbl_running = True
         self.tbl_cancel = False
         self._log(f"[table ] building {out.name} (fast K ladder) "
@@ -1279,7 +1319,7 @@ class App:
                         f"Check the log panel for details "
                         f"(click 'Show terminal')."))
                 elif job[0] == "quant_done":
-                    self.btn_min_quant.config(text="Make dynamic quant")
+                    self._restore_stop()
                     for b in self.all_btns:
                         b.config(state="normal")
                 elif job[0] == "imatrix_fail":
@@ -1288,12 +1328,12 @@ class App:
                         f"Check the log panel for details "
                         f"(click 'Show terminal')."))
                 elif job[0] == "imatrix_done":
-                    self.btn_imatrix.config(text="Make imatrix")
+                    self._restore_stop()
                     for b in self.all_btns:
                         b.config(state="normal")
                 elif job[0] == "table_done":
                     ok, name = job[1], job[2]
-                    self.btn_table.config(text="Build table")
+                    self._restore_stop()
                     self.tbl_running = False
                     self._model_src = None     # re-discover the new table
                     q.set_table_source(self.src_var.get().strip(),
