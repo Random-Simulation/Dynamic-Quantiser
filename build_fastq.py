@@ -60,14 +60,17 @@ def build_unix(cc="gcc"):
     """Build fastq.c as a shared library on Linux (gcc) or macOS (clang).
     Returns the output path."""
     src = APP_DIR / "fastq.c"
-    if platform.system() == "Darwin":
+    is_mac = platform.system() == "Darwin"
+    if is_mac:
         out = APP_DIR / "libfastq.dylib"
         cc = cc or "clang"
+        extra = ""
     else:
         out = APP_DIR / "libfastq.so"
+        extra = " -lm -ldl"
     if out.exists():
         out.unlink()
-    cmd = f'{cc} -O2 -shared -fPIC -o "{out}" "{src}"'
+    cmd = f'{cc} -O2 -shared -fPIC -mavx2 -o "{out}" "{src}"{extra}'
     r = subprocess.run(cmd, shell=True, cwd=str(APP_DIR),
                        capture_output=True, text=True)
     sys.stdout.write(r.stdout)

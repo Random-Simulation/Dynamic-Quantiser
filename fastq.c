@@ -1,22 +1,32 @@
 /* fastq.c -- fused quantize+dequantize+f64-accumulate kernel for
  * cosine-table builds (see PLAN_FUSED_CPP.md).
  *
- * Loads ggml-base.dll (the SAME dll the table fingerprint pins) and uses
+ * Loads the ggml-base shared library (ggml-base.dll on Windows,
+ * libggml-base.so on Linux, libggml-base.dylib on macOS) and uses
  * its ggml_quantize_chunk / dequantize_row_* -- so produced bytes are
  * bit-exact with llama-quantize. The f64 dot/sumsq that the Python engine
  * used to do with 40+ B/elem/tier of numpy casts is fused into one pass
  * over the dequantized row: ~17 B/elem/tier total.
  *
- * Compiled:  cl /O2 /W3 /LD fastq.c /Fe:fastq.dll
- * No Python API -- plain C DLL, driven via ctypes (fastq.py).
+ * Compiled:
+ *   Windows: cl /O2 /W3 /arch:AVX2 /LD fastq.c /Fe:fastq.dll
+ *   Linux:   gcc -O2 -shared -fPIC -mavx2 fastq.c -o libfastq.so -lm -ldl
+ *   macOS:   clang -O2 -shared -fPIC -mavx2 fastq.c -o libfastq.dylib
+ * No Python API -- plain C shared library, driven via ctypes (fastq.py).
  */
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <intrin.h>
 #include <smmintrin.h>
 #include <nmmintrin.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <time.h>
+#endif
 
 typedef size_t (*fn_quantize_chunk)(int, const float *, void *,
                                     int64_t, int64_t, int64_t,
@@ -25,9 +35,17 @@ typedef void (*fn_dequant_row)(void *, float *, int64_t);
 typedef int64_t (*fn_blck_size)(int);
 typedef size_t (*fn_type_size)(int);
 
+#ifdef _WIN32
 #define FQAPI __declspec(dllexport)
+#else
+#define FQAPI __attribute__((visibility("default")))
+#endif
 
+#ifdef _WIN32
 static HMODULE g_ggml = NULL;
+#else
+static void *g_ggml = NULL;
+#endif
 static fn_quantize_chunk g_quantize_chunk = NULL;
 static fn_blck_size g_blck_size = NULL;
 static fn_type_size g_type_size = NULL;
@@ -77,9 +95,10 @@ static const char *sym_name(int t) {
     }
 }
 
-/* Load ggml-base.dll and resolve all symbols. 0 ok, -1 fail. */
+/* Load the ggml-base shared library and resolve all symbols. 0 ok, -1 fail. */
 FQAPI int fq_init(const char *ggml_dll_path) {
     if (g_ggml) return 0;
+#ifdef _WIN32
     g_ggml = LoadLibraryA(ggml_dll_path);
     if (!g_ggml) return -1;
     g_quantize_chunk = (fn_quantize_chunk)
@@ -92,6 +111,24 @@ FQAPI int fq_init(const char *ggml_dll_path) {
         const char *nm = sym_name(t);
         if (nm) g_deq[t] = (fn_dequant_row)GetProcAddress(g_ggml, nm);
     }
+#else
+    g_ggml = dlopen(ggml_dll_path, RTLD_NOW);
+    if (!g_ggml) return -1;
+    g_quantize_chunk = (fn_quantize_chunk)
+        dlsym(g_ggml, "ggml_quantize_chunk");
+    g_blck_size = (fn_blck_size)dlsym(g_ggml, "ggml_blck_size");
+    g_type_size = (fn_type_size)dlsym(g_ggml, "ggml_type_size");
+    if (!g_quantize_chunk || !g_blck_size || !g_type_size) {
+        dlclose(g_ggml);
+        g_ggml = NULL;
+        return -1;
+    }
+    for (int t = 0; t < N_TYPES; t++) g_deq[t] = NULL;
+    for (int t = 0; t < N_TYPES; t++) {
+        const char *nm = sym_name(t);
+        if (nm) g_deq[t] = (fn_dequant_row)dlsym(g_ggml, nm);
+    }
+#endif
     return 0;
 }
 
@@ -148,9 +185,14 @@ FQAPI int fq_gate(int type, int64_t n, int64_t npr, const float *imx,
 /* Diagnostic: time the A = ||a||^2 pass alone (seconds). */
 FQAPI double fq_time_a(const float *a, int64_t n) {
     double acc = 0.0;
+#ifdef _WIN32
     LARGE_INTEGER fq, fq2, pc;
     QueryPerformanceFrequency(&pc);
     QueryPerformanceCounter(&fq);
+#else
+    struct timespec fq, fq2;
+    clock_gettime(CLOCK_MONOTONIC, &fq);
+#endif
     for (int64_t off = 0; off < n; off += ACC_CHUNK) {
         int64_t m = n - off < ACC_CHUNK ? n - off : ACC_CHUNK;
         double c = 0.0, cc = 0.0;
@@ -160,9 +202,16 @@ FQAPI double fq_time_a(const float *a, int64_t n) {
         }
         acc += acc_finish(c, cc);
     }
+#ifdef _WIN32
     QueryPerformanceCounter(&fq2);
     (void)acc;
     return (double)(fq2.QuadPart - fq.QuadPart) / pc.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &fq2);
+    (void)acc;
+    return (double)(fq2.tv_sec - fq.tv_sec)
+         + (double)(fq2.tv_nsec - fq.tv_nsec) / 1e9;
+#endif
 }
 
 /* Diagnostic: time one type's quantize / dequantize / f64-accumulate /
@@ -173,17 +222,38 @@ FQAPI int fq_time(int type, const float *a, int64_t n, int64_t npr,
     if (fq_gate(type, n, npr, imx, SIZE_MAX) != 0) return -1;
     int64_t bs = g_blck_size(type);
     size_t need = (size_t)(n / bs) * g_type_size(type);
+#ifdef _WIN32
     LARGE_INTEGER fq, fq2, pc;
     QueryPerformanceFrequency(&pc);
     QueryPerformanceCounter(&fq);
+#else
+    struct timespec fq, fq2;
+    clock_gettime(CLOCK_MONOTONIC, &fq);
+#endif
     size_t rc = g_quantize_chunk(type, a, raw, 0, n / npr, npr, imx);
+#ifdef _WIN32
     QueryPerformanceCounter(&fq2);
     if (rc != need) return -1;
     out[0] = (double)(fq2.QuadPart - fq.QuadPart) / pc.QuadPart;
     QueryPerformanceCounter(&fq);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &fq2);
+    if (rc != need) return -1;
+    out[0] = (double)(fq2.tv_sec - fq.tv_sec)
+           + (double)(fq2.tv_nsec - fq.tv_nsec) / 1e9;
+    clock_gettime(CLOCK_MONOTONIC, &fq);
+#endif
     g_deq[type](raw, bb, n);
+#ifdef _WIN32
     QueryPerformanceCounter(&fq2);
     out[1] = (double)(fq2.QuadPart - fq.QuadPart) / pc.QuadPart;
+    QueryPerformanceCounter(&fq);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &fq2);
+    out[1] = (double)(fq2.tv_sec - fq.tv_sec)
+           + (double)(fq2.tv_nsec - fq.tv_nsec) / 1e9;
+    clock_gettime(CLOCK_MONOTONIC, &fq);
+#endif
     double accS = 0.0, accQ = 0.0;
     for (int64_t off = 0; off < n; off += ACC_CHUNK) {
         int64_t m = n - off < ACC_CHUNK ? n - off : ACC_CHUNK;
@@ -197,8 +267,14 @@ FQAPI int fq_time(int type, const float *a, int64_t n, int64_t npr,
         accS += acc_finish(cs, cc);
         accQ += acc_finish(cq, qc);
     }
+#ifdef _WIN32
     QueryPerformanceCounter(&fq2);
     out[2] = (double)(fq2.QuadPart - fq.QuadPart) / pc.QuadPart;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &fq2);
+    out[2] = (double)(fq2.tv_sec - fq.tv_sec)
+           + (double)(fq2.tv_nsec - fq.tv_nsec) / 1e9;
+#endif
     (void)accS; (void)accQ;
     return 0;
 }

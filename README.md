@@ -16,16 +16,99 @@ standard Qx_K_M quants. Whole-model cosine deviation is highly correlated
 with KLD (a 0.99 Pearson correlation) - a good measure of quant quality.
 Once the initial table has been built, solutions are just seconds.
 
-## QuickStart
+## QuickStart – Windows
 
 1. Unzip and double click `Dynamic-Quantiser.exe` (or run `python quant_maker.py`)
 2. Enter the path for a bf16 model in **Source**
 3. Enter the path to the llama.cpp binaries in **Binaries**
+   (the `llama-quantize.exe`, `llama-imatrix.exe` and `ggml-base.dll`
+   from your llama.cpp build)
 4. Optionally enter an imatrix path (or make one)
 5. Click **Build Table** (this takes a while, ~30s per GB)
 6. Click **Make Dynamic Quant**
 
 The table is a one-off build. After that, solutions are just seconds.
+
+## QuickStart – Linux
+
+1. **Install Python 3.10+ and numpy** (if you don't have them already):
+   ```bash
+   sudo apt install python3 python3-pip
+   pip3 install numpy
+   ```
+
+2. **Install a C compiler** (one-time, to build the fast kernel):
+   ```bash
+   sudo apt install build-essential
+   ```
+
+3. **Build the fast table-build kernel** (one-time):
+   ```bash
+   python3 build_fastq.py
+   ```
+   This compiles `fastq.c` into `libfastq.so` using `gcc`. You only
+   need to do this once, or if you update the source code.
+
+4. **Get the llama.cpp Linux binaries** – `llama-quantize`,
+   `llama-imatrix` and `libggml-base.so`. Drop them in a `binaries`
+   folder next to the app, or put them on your `PATH`.
+
+5. **Run the app:**
+   ```bash
+   python3 quant_maker.py
+   ```
+   A window opens – the same one as Windows.
+
+6. Enter the path for a bf16 model in **Source**
+7. Enter the path to the llama.cpp binaries in **Binaries**
+8. Optionally enter an imatrix path (or make one)
+9. Click **Build Table** (this takes a while, ~30s per GB)
+10. Click **Make Dynamic Quant**
+
+## QuickStart – macOS
+
+> **Note for Apple Silicon Macs (M1/M2/M3/M4):** the fast C kernel uses
+> x86-specific instructions and won't compile on Apple Silicon. The app
+> still works fine – it just uses the (slower) pure-Python table builder
+> instead. **Intel Macs** can build the fast kernel as normal.
+
+1. **Install Python 3.10+** (if you don't have it already):
+   ```bash
+   brew install python
+   ```
+   (If you don't have Homebrew, install it first from
+   [brew.sh](https://brew.sh). Or download Python from
+   [python.org](https://python.org) – the installer includes tkinter.)
+
+2. **Install numpy:**
+   ```bash
+   pip3 install numpy
+   ```
+
+3. **Build the fast table-build kernel** – Intel Macs only, one-time:
+   ```bash
+   python3 build_fastq.py
+   ```
+   This compiles `fastq.c` into `libfastq.dylib` using `clang`
+   (built-in with macOS, no extra install needed).
+   *Skip this step on Apple Silicon Macs – the app will use the
+   pure-Python table builder instead.*
+
+4. **Get the llama.cpp macOS binaries** – `llama-quantize`,
+   `llama-imatrix` and `libggml-base.dylib`. Drop them in a `binaries`
+   folder next to the app, or put them on your `PATH`.
+
+5. **Run the app:**
+   ```bash
+   python3 quant_maker.py
+   ```
+   A window opens – the same one as Windows.
+
+6. Enter the path for a bf16 model in **Source**
+7. Enter the path to the llama.cpp binaries in **Binaries**
+8. Optionally enter an imatrix path (or make one)
+9. Click **Build Table** (this takes a while, ~30s per GB)
+10. Click **Make Dynamic Quant**
 
 ## How it works
 
@@ -46,9 +129,14 @@ There are 3 different algorithms in the program:
 ## Requirements
 
 - Python 3.10+ with `numpy` (see `requirements.txt`).
-- The llama.cpp binaries: `llama-quantize`, `llama-imatrix` and
-  `ggml-base.dll`. Drop them in a `binaries` folder next to the app (it
-  also looks in a couple of other spots and your system `PATH`).
+- A C compiler, to build the fast table-build kernel one-off
+  (`python build_fastq.py`). *Optional on Apple Silicon Macs – the app
+  falls back to the pure-Python table builder.*
+- The llama.cpp binaries, in a `binaries` folder next to the app
+  (the app also looks in a couple of other spots and your system `PATH`):
+  - **Windows**: `llama-quantize.exe`, `llama-imatrix.exe`, `ggml-base.dll`
+  - **Linux**: `llama-quantize`, `llama-imatrix`, `libggml-base.so`
+  - **macOS**: `llama-quantize`, `llama-imatrix`, `libggml-base.dylib`
 - A starting `.gguf` model - a bf16 one works best.
 
 `gguf-py/` is a bundled copy of the `gguf` library, so there's nothing
@@ -75,7 +163,7 @@ extra to install.
     python tablebuild2.py --source m.gguf [--ladder-kind k|full]
     # numpy reference table (+ --check-tier byte-exactness gate)
     python tablebuild.py --source m.gguf [--imatrix i.gguf] [--check-tier T]
-    # compile the C kernel (one-off, MSVC)
+    # compile the C kernel (one-off)
     python build_fastq.py
 
 ## Project layout
@@ -85,7 +173,8 @@ extra to install.
 - `qsolve.py` / `qfullsolve.py` - the solvers that pick the best mix of sizes
 - `tablebuild.py` / `tablebuild2.py` / `tablestore.py` - build and save the
   size/accuracy table
-- `fastq.py` / `fastq.c` / `fastq.dll` - the fast C bit that speeds up table
-  building
-- `build_fastq.py` - compiles that C bit (only needed once)
-- `Dynamic-Quantiser.spec` - recipe for building the `Dynamic-Quantiser.exe` build
+- `fastq.py` / `fastq.c` - the fast C kernel that speeds up table building
+  (compiled to `fastq.dll` on Windows, `libfastq.so` on Linux,
+  `libfastq.dylib` on macOS)
+- `build_fastq.py` - compiles the C kernel (only needed once, cross-platform)
+- `Dynamic-Quantiser.spec` - recipe for building the Windows `Dynamic-Quantiser.exe`
