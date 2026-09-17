@@ -1,11 +1,15 @@
-"""fastq.py -- ctypes bindings for fastq.dll (fused table-build kernel).
+"""fastq.py -- ctypes bindings for the fastq shared library
+(fused table-build kernel).
 
-FastQ loads fastq.dll and (through it) the project's ggml-base.dll.
+FastQ loads the fastq shared library (fastq.dll on Windows,
+libfastq.so on Linux, libfastq.dylib on macOS) and (through it)
+the project's ggml-base library.
   segment(a, npr, types, imx)   -> (A, S, Q) fused f64 stats for one
                                    256M-elem-or-smaller segment, all tiers
 Enums and sizes mirror tablebuild.py (same ggml.h values).
 """
 import ctypes
+import platform
 import sys
 from ctypes import (POINTER, c_float, c_int, c_int64, c_uint8, c_double)
 from pathlib import Path
@@ -15,25 +19,40 @@ import numpy as np
 APP_DIR = Path(__file__).resolve().parent
 
 
+def _fastq_names():
+    """Platform-appropriate shared-library filenames for fastq."""
+    sysname = platform.system()
+    if sysname == "Windows":
+        return ["fastq.dll"]
+    elif sysname == "Darwin":
+        return ["libfastq.dylib"]
+    else:
+        return ["libfastq.so"]
+
+
 def _find_fastq():
-    """Locate fastq.dll: next to the module, next to the frozen .exe (and
-    its _internal / binaries subdirs), or in a project binaries dir."""
-    cands = [APP_DIR / "fastq.dll"]
+    """Locate the fastq shared library: next to the module, next to the
+    frozen executable (and its _internal / binaries subdirs), or in a
+    project binaries dir."""
+    names = _fastq_names()
+    cands = [APP_DIR / n for n in names]
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable)
-        cands += [exe.parent / "fastq.dll",
-                  exe.parent / "_internal" / "fastq.dll",
-                  exe.parent / "binaries" / "fastq.dll"]
-    cands += [APP_DIR.parent / "fastq.dll",
-              APP_DIR / "binaries" / "fastq.dll"]
+        for n in names:
+            cands += [exe.parent / n,
+                      exe.parent / "_internal" / n,
+                      exe.parent / "binaries" / n]
+    cands += [APP_DIR.parent / n for n in names]
+    cands += [APP_DIR / "binaries" / n for n in names]
     for c in cands:
         if c.exists():
             return c
+    primary = names[0]
     raise RuntimeError(
-        "fastq.dll not found. Searched: "
+        f"{primary} not found. Searched: "
         + ", ".join(str(c) for c in cands)
-        + ". Rebuild the .exe with fastq.dll bundled, or copy fastq.dll "
-          "next to the app.")
+        + f". Rebuild for your platform (python build_fastq.py), or copy "
+          f"{primary} next to the app.")
 
 # ggml enums (ggml.h, stable) -- superset: ladder + fallback types
 ENUM = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7,

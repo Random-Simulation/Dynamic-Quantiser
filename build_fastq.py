@@ -1,8 +1,13 @@
-"""build_fastq.py -- compile fastq.c -> fastq.dll with MSVC (one-shot).
+"""build_fastq.py -- compile fastq.c into a platform shared library.
 
 Usage: python build_fastq.py
-Finds VS via vswhere, runs cl through vcvars64. No CMake, no Python API.
+  Windows: finds VS via vswhere, runs cl through vcvars64 -> fastq.dll
+  Linux:   gcc -shared -fPIC -> libfastq.so
+  macOS:   clang -shared -fPIC -> libfastq.dylib
+No CMake, no Python API.
 """
+import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +37,7 @@ def find_vcvars():
     sys.exit("ERROR: vcvars64.bat not found (install VS C++ build tools)")
 
 
-def main():
+def build_windows():
     vcvars = find_vcvars()
     src = APP_DIR / "fastq.c"
     out = APP_DIR / "fastq.dll"
@@ -48,8 +53,36 @@ def main():
     # cl leaves build artifacts behind
     for p in ("fastq.obj", "fastq.lib", "fastq.exp"):
         (APP_DIR / p).unlink(missing_ok=True)
+    return out
+
+
+def build_unix(cc="gcc"):
+    """Build fastq.c as a shared library on Linux (gcc) or macOS (clang).
+    Returns the output path."""
+    src = APP_DIR / "fastq.c"
+    if platform.system() == "Darwin":
+        out = APP_DIR / "libfastq.dylib"
+        cc = cc or "clang"
+    else:
+        out = APP_DIR / "libfastq.so"
+    if out.exists():
+        out.unlink()
+    cmd = f'{cc} -O2 -shared -fPIC -o "{out}" "{src}"'
+    r = subprocess.run(cmd, shell=True, cwd=str(APP_DIR),
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
     if not out.exists():
         sys.exit("ERROR: build failed")
+    return out
+
+
+def main():
+    sysname = platform.system()
+    if sysname == "Windows":
+        out = build_windows()
+    else:
+        out = build_unix()
     print(f"OK -> {out} ({out.stat().st_size} bytes)")
 
 

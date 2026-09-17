@@ -49,10 +49,11 @@ MINIMISE_BTN_WIDTH_PX = 170              # shared width for the two minimise but
 
 
 def _find_bin(name, extra_dir=None):
-    """Find `name` (+ .exe) in: the user's Binaries dir, a binaries/ folder
-    next to the app / .exe, and finally PATH."""
+    """Find `name` (and `name.exe` on Windows) in: the user's Binaries dir,
+    a binaries/ folder next to the app, and finally PATH."""
     import shutil
-    names = [name + ".exe", name]
+    import platform
+    names = [name + ".exe", name] if platform.system() == "Windows" else [name]
     cands = []
     if extra_dir:
         cands.append(Path(extra_dir))
@@ -64,8 +65,11 @@ def _find_bin(name, extra_dir=None):
         for n in names:
             if (c / n).exists():
                 return c / n
-    p = shutil.which(names[0])
-    return Path(p) if p else None
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return Path(p)
+    return None
 
 
 # startup lookup (no user dir yet); the GUI re-resolves dynamically via
@@ -392,14 +396,14 @@ class App:
                                                      "GGUF imatrix"
                                                      )).grid(
             row=2, column=2, sticky="e", padx=(4, 0), pady=2)
-        # Folder holding the llama.cpp binaries (ggml-base.dll, llama-
-        # quantize.exe, llama-imatrix.exe). Empty = auto-search.
+        # Folder holding the llama.cpp binaries (ggml-base shared lib,
+        # llama-quantize, llama-imatrix). Empty = auto-search.
         self.bin_var = path_row(3, "Binaries", DEFAULTS["binaries"])
         ttk.Button(p, text="...", width=3, style="Small.TButton",
                    command=self._browse_bin_dir).grid(
             row=3, column=2, sticky="e", padx=(4, 0), pady=2)
-        ttk.Label(p, text="ggml-base.dll + llama-quantize.exe + "
-                          "llama-imatrix.exe",
+        ttk.Label(p, text="ggml-base lib + llama-quantize + "
+                          "llama-imatrix",
                   style="Hint.TLabel").grid(
             row=4, column=1, sticky="w", pady=(0, 2))
 

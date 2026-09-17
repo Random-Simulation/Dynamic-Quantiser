@@ -18,7 +18,7 @@ Once the initial table has been built, solutions are just seconds.
 
 ## QuickStart
 
-1. Double click `Dynamic-Quantiser.exe` (or run `python quant_maker.py`)
+1. Unzip and double click `Dynamic-Quantiser.exe` (or run `python quant_maker.py`)
 2. Enter the path for a bf16 model in **Source**
 3. Enter the path to the llama.cpp binaries in **Binaries**
 4. Optionally enter an imatrix path (or make one)
