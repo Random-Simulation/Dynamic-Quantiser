@@ -137,6 +137,7 @@ There are 3 different algorithms in the program:
   - **Windows**: `llama-quantize.exe`, `llama-imatrix.exe`, `ggml-base.dll`
   - **Linux**: `llama-quantize`, `llama-imatrix`, `libggml-base.so`
   - **macOS**: `llama-quantize`, `llama-imatrix`, `libggml-base.dylib`
+  [Prebuilt binaries are available on the llama.cpp releases page](https://github.com/ggml-org/llama.cpp/releases).
 - A starting `.gguf` model - a bf16 one works best.
 
 `gguf-py/` is a bundled copy of the `gguf` library, so there's nothing
@@ -178,3 +179,7 @@ extra to install.
   `libfastq.dylib` on macOS)
 - `build_fastq.py` - compiles the C kernel (only needed once, cross-platform)
 - `Dynamic-Quantiser.spec` - recipe for building the Windows `Dynamic-Quantiser.exe`
+
+## Acknowledgements
+
+Made with local Qwen 3.8 27b inside Bare agentic harness.
