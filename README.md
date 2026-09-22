@@ -4,9 +4,8 @@ Allows anyone to make their own dynamic quantisations of LLM .gguf files.
 Automatic, fast and fairly optimal - considerably more accurate than
 standard K quants. Should work with any llama.cpp compatible .gguf file
 (bf16/f16/f32). Chooses tensors at mixed quantisation levels to minimise
-whole-model cosine deviation, which is highly correlated with KLD. Also
-lets you make your own custom quantisations by picking layers/groups at
-different quantisation levels.
+whole-model cosine deviation. Also lets you make your own custom 
+quantisations by picking layers/groups at different quantisation levels.
 
 ## Motivation
 

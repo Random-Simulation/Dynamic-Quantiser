@@ -22,3 +22,6 @@ imatrix.dat
 *.gguf
 tables/
 refs_tmp/
+
+# Other
+Reddit.txt

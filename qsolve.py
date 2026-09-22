@@ -74,9 +74,16 @@ def solve(target_gb, use_imatrix=False):
     # be the true min when imatrix-required IQ tiers fall back to a K tier).
     min_cost = float(CG.min(axis=1).sum())
     if B < min_cost:
-        return None, (f"target {target_gb:g} GB is below the minimum "
-                      f"({(min_cost + frozen + t['overhead'])/1e9:.2f} GB, "
-                      "smallest tier per group)")
+        # A float64 GB<->bytes round trip can land ~1e-15*B below the true
+        # value (e.g. solve_min_size's lo is computed in GB and round-trips
+        # through here), so treat sub-round-trip shortfalls as exactly the
+        # floor. A genuinely sub-floor target differs by whole bytes.
+        if B >= min_cost - 1e-12 * max(1.0, abs(min_cost)):
+            B = min_cost
+        else:
+            return None, (f"target {target_gb:g} GB is below the minimum "
+                          f"({(min_cost + frozen + t['overhead'])/1e9:.6f} GB, "
+                          "smallest tier per group)")
 
     def cosval(Su, Qu):
         return (Su + s0) / np.sqrt(A * (Qu + q0))
@@ -240,12 +247,13 @@ def solve(target_gb, use_imatrix=False):
     }, None)
 
 
-def solve_min_size(target_cos, use_imatrix=False, tol_gb=0.05):
+def solve_min_size(target_cos, use_imatrix=False, tol_gb=None):
     """Smallest size in the group+bump space achieving cos >= target_cos.
 
-    cos(solution(B)) is monotone non-decreasing in the byte budget B, so
-    binary-search B between the all-IQ1_S minimum and a feasible upper
-    bracket, then return the (re)solved assignment at the top of the range.
+    cos(solution(B)) is monotone non-decreasing in the byte budget B (up
+    to ~1e-6 polish wiggles), so binary-search B between the per-group
+    floor and the all-top-tier maximum, then scan the final window left
+    to right to snap to the smallest feasible solution.
     """
     t = q._load_cos("imatrix" if use_imatrix else "plain")
     if t is None:
@@ -254,8 +262,11 @@ def solve_min_size(target_cos, use_imatrix=False, tol_gb=0.05):
         return None, f"target cosine {target_cos} outside (0,1)"
 
     SG, QG, CG, SL, QL, CL = _matrices(t)
+    K = len(t["ladder"])
     frozen = t["c0"]
-    lo = (float(CG.min(axis=1).sum()) + frozen + t["overhead"]) / 1e9
+    min_cost = float(CG.min(axis=1).sum())
+    lo = (min_cost + frozen + t["overhead"]) / 1e9
+    hi = (float(CG[:, K - 1].sum()) + frozen + t["overhead"]) / 1e9
 
     res, err = solve(lo, use_imatrix)
     if res is None:
@@ -264,18 +275,21 @@ def solve_min_size(target_cos, use_imatrix=False, tol_gb=0.05):
         res["method"] += " (min-size)"
         return res, None          # even the smallest build beats the target
 
-    hi = 12.0
-    while True:
-        res, err = solve(hi, use_imatrix)
-        if res is None:
-            return None, err
-        if res["cos"] >= target_cos:
-            break
-        hi *= 1.6
-        if hi > 40.0:
-            return None, (f"cannot reach cos {target_cos:.6f} "
-                          f"(best below {hi/1.6:g} GB is "
-                          f"{res['cos']:.6f})")
+    # hi = the all-top-tier build, which is always feasible and has the
+    # maximum cos, so no upper-bracket search is needed.
+    res, err = solve(hi, use_imatrix)
+    if res is None:
+        return None, err
+    if res["cos"] < target_cos:
+        return None, (f"cannot reach cos {target_cos:.6f} "
+                      f"(best at {hi:.3f} GB is {res['cos']:.6f})")
+
+    if tol_gb is None:
+        # 0.2% of the feasible byte span (floor 0.5 MB). A fixed absolute
+        # tolerance (e.g. 50 MB) is huge for small models -- on a 0.5 GB
+        # model it leaves the achieved deviation ~30% off the target.
+        span_gb = (float(CG[:, K - 1].sum()) - min_cost) / 1e9
+        tol_gb = max(0.0005, 0.002 * span_gb)
     while hi - lo > tol_gb:
         mid = (lo + hi) / 2
         res_mid, err = solve(mid, use_imatrix)
@@ -285,5 +299,16 @@ def solve_min_size(target_cos, use_imatrix=False, tol_gb=0.05):
             hi, res = mid, res_mid
         else:
             lo = mid
+    # cos is a step function of the budget, so the hi solution may sit up
+    # to tol_gb above the true minimum: scan the final window left to
+    # right and keep the first (smallest) feasible point. 4 points suffice
+    # -- below the window/4 step the tier assignments don't change anyway,
+    # and near-threshold solves are the expensive ones (active constraint).
+    for i in range(1, 5):
+        gb = lo + (hi - lo) * i / 4
+        r2, _ = solve(gb, use_imatrix)
+        if r2 is not None and r2["cos"] >= target_cos:
+            res = r2
+            break
     res["method"] += " (min-size)"
     return res, None

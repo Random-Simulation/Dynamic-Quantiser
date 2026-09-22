@@ -247,8 +247,13 @@ def solve(target_gb, use_imatrix=False, restarts=16):
     min_bytes = float(C.min(axis=1).sum())
     minsize = (min_bytes + t["c0"] + t["overhead"]) / 1e9
     if B < min_bytes:
-        return None, (f"target {target_gb:g} GB is below the minimum "
-                      f"({minsize:.2f} GB, smallest tier per tensor)")
+        # A float64 GB<->bytes round trip can land ~1e-15*B below the true
+        # value, so treat sub-round-trip shortfalls as exactly the floor.
+        if B >= min_bytes - 1e-12 * max(1.0, abs(min_bytes)):
+            B = min_bytes
+        else:
+            return None, (f"target {target_gb:g} GB is below the minimum "
+                          f"({minsize:.6f} GB, smallest tier per tensor)")
 
     x0 = np.full(m, ladder.index("Q4_K"), np.int64)
     xlag, clag = _lagrange(B, S, Q, C, AR, s0, q0, A, K, x0)

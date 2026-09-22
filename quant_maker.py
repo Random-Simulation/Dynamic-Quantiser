@@ -395,9 +395,9 @@ class App:
         self.imx_var = path_row(2, "Imatrix", DEFAULTS["imatrix"])
         self.imx_var.trace_add("write", lambda *a: self._on_table_changed())
         ttk.Button(p, text="...", width=3, style="Small.TButton",
-                   command=lambda: self._browse_gguf(self.imx_var,
-                                                     "GGUF imatrix"
-                                                     )).grid(
+                   command=lambda: self._browse_gguf(
+                       self.imx_var, "Imatrix (GGUF or dat)",
+                       exts=(".gguf", ".dat"))).grid(
             row=2, column=2, sticky="e", padx=(4, 0), pady=2)
         # Folder holding the llama.cpp binaries (ggml-base shared lib,
         # llama-quantize, llama-imatrix). Empty = auto-search.
@@ -532,16 +532,21 @@ class App:
             self.btn_term.config(text="Show terminal")
 
     # ------------------------------------------------------------- browse
-    def _browse_gguf(self, var, title):
+    def _browse_gguf(self, var, title, exts=(".gguf",)):
         """Native file picker (Windows Explorer / macOS panel / GTK on
         Linux -- one call, no per-platform code). Setting the var fires
-        the existing trace, so the model loads exactly as if typed."""
+        the existing trace, so the model loads exactly as if typed.
+        exts: accepted extensions -- imatrix accepts both .gguf and
+        .dat (llama-imatrix --output-format dat)."""
         cur = var.get().strip()
         curdir = os.path.dirname(cur)
         init = curdir if (cur and os.path.isdir(curdir)) else str(APP_DIR)
+        label = ("GGUF files" if exts == (".gguf",)
+                 else "Imatrix files (*.gguf, *.dat)")
         p = filedialog.askopenfilename(
             parent=self.root, title=title, initialdir=init,
-            filetypes=[("GGUF files", "*.gguf"), ("All files", "*.*")])
+            filetypes=[(label, " ".join("*" + e for e in exts)),
+                       ("All files", "*.*")])
         if p:
             var.set(p)
 
